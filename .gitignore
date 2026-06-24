@@ -1,0 +1,7 @@
+# This folder also holds the dataset — ignore everything by default
+/*
+# Re-include only code and docs
+!/.gitignore
+!/README.md
+!/*.py
+!/*.ipynb
