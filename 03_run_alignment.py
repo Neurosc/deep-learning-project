@@ -28,7 +28,7 @@ OUTPUT (in ~/things_eeg/results/):
 Usage:
     python 03_run_alignment.py
     # Runtime scales with the number of seeds: 18 targets x 9 windows x N seeds
-    # decoders. Start with fewer seeds (e.g. SEEDS=[0,1,2]) for a first pass.
+    # decoders. Start with fewer seeds (e.g. SEEDS=[0]) for a quick first pass.
 """
 
 import os
@@ -192,4 +192,47 @@ def main():
                 raw[(tgt_name, wname, seed)] = (ep, vl, tl, top1)
                 print(f"{tgt_name:24s} {wname:9s} seed{seed} | ep{ep:2d} "
                       f"val{vl:.3f} test{tl:.3f} top1{top1 * 100:4.1f}% "
-                
+                      f"[{time.time() - t0:.0f}s]", flush=True)
+
+    # --- write the per-seed raw results ---
+    with open(OUT_CSV_SEEDS, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["target", "window", "seed", "best_epoch", "val_loss", "test_loss", "top1"])
+        for (tgt, wname, seed), (ep, vl, tl, top1) in raw.items():
+            w.writerow([tgt, wname, seed, ep, round(vl, 4), round(tl, 4), round(top1, 4)])
+    print("\nSAVED", OUT_CSV_SEEDS, flush=True)
+
+    # --- average over seeds and write the aggregated results (step 04 reads this) ---
+    with open(OUT_CSV, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["target", "window", "test_loss", "test_loss_std", "top1", "n_seeds"])
+        for tgt_name in targets:
+            for wname in WINDOWS:
+                tls  = [raw[(tgt_name, wname, s)][2] for s in SEEDS]
+                tops = [raw[(tgt_name, wname, s)][3] for s in SEEDS]
+                w.writerow([tgt_name, wname,
+                            round(float(np.mean(tls)), 4),
+                            round(float(np.std(tls)), 4),
+                            round(float(np.mean(tops)), 4),
+                            len(SEEDS)])
+    print("SAVED", OUT_CSV, flush=True)
+
+    # --- stability check: per layer, which window is best for each seed? ---
+    # If the same window wins across all seeds, the early->late pattern is robust.
+    post = [w for w in WINDOWS if w != "baseline"]   # ignore the pre-stimulus control
+    print("\n=== Best-window stability across seeds ===", flush=True)
+    print(f"{'target':24s} {'best window per seed':>32s}   agreement", flush=True)
+    for tgt_name in targets:
+        best_per_seed = []
+        for s in SEEDS:
+            tls = [raw[(tgt_name, w, s)][2] for w in post]
+            best_per_seed.append(post[int(np.argmin(tls))])
+        vals, counts = np.unique(best_per_seed, return_counts=True)
+        mode = vals[int(np.argmax(counts))]
+        agree = counts.max() / len(SEEDS)
+        print(f"{tgt_name:24s} {str(best_per_seed):>32s}   {mode} ({agree*100:.0f}%)",
+              flush=True)
+
+
+if __name__ == "__main__":
+    main()
