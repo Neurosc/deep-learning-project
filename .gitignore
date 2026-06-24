@@ -5,3 +5,11 @@
 !/README.md
 !/*.py
 !/*.ipynb
+!/*.sh
+
+# Allow the results folder, but only the small text/figure outputs
+# (CSVs and PNG figures) — never the dataset or model files.
+!/results/
+/results/*
+!/results/*.csv
+!/results/*.png
