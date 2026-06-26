@@ -10,7 +10,9 @@ INPUT (from the THINGS-EEG2 dataset):
     [image, repetition, channel, time].
 
 WHAT IT DOES:
-    1. Drops the non-brain 'stim' trigger channel (64 -> 63 channels).
+    1. Drops the non-brain 'stim' trigger channel (64 -> 63 channels). 
+    that one is to note when things happened during the experiment — for example, 
+    the exact moment an image appeared on the screen. 
     2. Averages over the repetitions of each image (each image was shown several
        times; averaging cancels random noise and keeps the brain's response to
        the image).
