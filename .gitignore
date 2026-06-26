@@ -2,7 +2,7 @@
 /*
 # Re-include only code and docs
 !/.gitignore
-!/README.md
+!/*.md
 !/*.py
 !/*.ipynb
 !/*.sh

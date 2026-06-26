@@ -3,7 +3,7 @@
 ==============
 One-off environment check. Run this FIRST, before the rest of the pipeline.
 
-It verifies three things and writes NO output files:
+It verifies three things:
     1. The EEG data loads and has the expected shape.
     2. The GPU is available and can run a computation.
     3. The three vision networks download and open correctly.
@@ -28,7 +28,7 @@ import torch
 print("=== numpy / data ===")
 print("numpy:", np.__version__)
 
-# One subject's preprocessed EEG file (the 63-channel version of the dataset).
+# One subject's preprocessed EEG file (63-channel).
 eeg_path = os.path.expanduser(
     "~/things_eeg/eeg_data/sub-01_63/sub-01__63_channels/preprocessed_eeg_training.npy"
 )
