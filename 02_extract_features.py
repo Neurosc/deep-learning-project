@@ -16,18 +16,24 @@ INPUT:
 
 WHAT IT DOES, per network:
     1. Loads the network with OpenAI pretrained weights.
-    2. Attaches "hooks" to 6 chosen layers. A hook copies that layer's output
-       into a dict whenever an image passes through (it does not change the network).
+    2. Attaches "hooks" to 6 chosen layers (a hook copies that layer's output
+       into a dict whenever an image passes through; it does not change the net).
     3. Runs every image through the network's vision tower in batches.
     4. Reduces each layer's output to one vector per image:
          - conv layers  -> Global Average Pooling (average over the spatial grid)
          - transformer  -> the CLS token (the token that summarises the whole image)
-    5. Shrinks each vector to 512 numbers with PCA (fit on train, applied to test).
+    5. Shrinks each vector to PCA_DIM numbers with PCA (fit on train, applied to test).
+
+VARIANTS (point #6): each image is processed twice -- once sharp, once foveated
+(centre-sharp, periphery-blurred) -- so every feature set has a sharp and a
+foveated version that step 03 can compare.
 
 OUTPUT (written to ~/things_eeg/features/):
-    <network>__<layer>__train.npy   shape (16540, 512)
-    <network>__<layer>__test.npy    shape (200,   512)
-    3 networks x 6 layers x 2 splits = 36 files.
+    <network>__<layer>__train.npy         sharp     features  (16540, PCA_DIM)
+    <network>__<layer>__test.npy
+    <network>__<layer>__fov__train.npy     foveated  features  (16540, PCA_DIM)
+    <network>__<layer>__fov__test.npy
+    layer_dimensions.csv                   native vs post-PCA dimension per layer
 
 Usage:
     python 02_extract_features.py
@@ -37,10 +43,11 @@ Usage:
 import os
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "3")   # choose GPU before importing torch
 
+import csv
 import numpy as np
 import torch
 import open_clip
-from PIL import Image
+from PIL import Image, ImageFilter
 from sklearn.decomposition import PCA
 
 ROOT    = os.path.expanduser("~/things_eeg")
@@ -51,8 +58,21 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH   = 64      # number of images processed at once
-PCA_DIM = 512     # final length of every feature vector
 LIMIT   = None    # set to a small number (e.g. 200) for a quick test; None = all images
+
+# PCA target dimension -- the single place to change the post-PCA feature length.
+# PENDING supervisor confirmation: shallow layers (e.g. RN50 stem) have a native
+# dimension below this, which the dimensionality check below will flag (see #1).
+PCA_DIM = 512
+
+# --- Foveation parameters (point #6) --- PENDING supervisor confirmation -------
+# A centre-sharp, periphery-degraded blur applied to each image before the network.
+FOVEATE        = True          # also produce a foveated variant of every feature set
+FOV_FIXATION   = (0.5, 0.5)    # gaze point (x, y) in relative image coords; (0.5,0.5)=centre
+FOV_FOVEA_FRAC = 0.15          # radius (fraction of the image) kept fully sharp
+FOV_MAX_BLUR   = 6.0           # Gaussian blur radius (px) reached at the far periphery
+FOV_FALLOFF    = 2.0           # how fast blur grows with eccentricity (higher = sharper centre)
+# ------------------------------------------------------------------------------
 
 # The 6 layers ("taps") to record from each network, ordered shallow -> deep.
 # RN50 taps are named stages; ViT taps are transformer block numbers (1-indexed).
@@ -75,6 +95,37 @@ def image_path(split, concept, fname):
     """Build the full path to one image file."""
     sub = "training_images" if split == "train" else "test_images"
     return os.path.join(IMG_DIR, sub, concept, fname)
+
+
+def foveate(img):
+    """Return a centre-sharp, periphery-blurred version of a PIL RGB image.
+
+    Blends the sharp image with a strongly blurred copy using a radial weight:
+    weight 0 inside the central fovea, rising to 1 at the periphery. The fovea
+    size, blur strength and fall-off are set by the FOV_* parameters above.
+    """
+    W, H   = img.size
+    sharp  = np.asarray(img, dtype=np.float32)
+    strong = np.asarray(img.filter(ImageFilter.GaussianBlur(FOV_MAX_BLUR)), dtype=np.float32)
+
+    fx, fy = FOV_FIXATION
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    dx = (xx - fx * W) / W
+    dy = (yy - fy * H) / H
+    ecc = np.sqrt(dx * dx + dy * dy)                 # eccentricity: 0 at fixation
+    ecc = ecc / ecc.max()                            # normalise to [0, 1]
+
+    # alpha = 0 within the fovea, ramps to 1 at the far periphery
+    a = np.clip((ecc - FOV_FOVEA_FRAC) / (1.0 - FOV_FOVEA_FRAC), 0.0, 1.0) ** FOV_FALLOFF
+    a = a[..., None]
+    out = (1.0 - a) * sharp + a * strong
+    return Image.fromarray(out.astype(np.uint8))
+
+
+# Image variants to extract: name suffix -> transform applied before the network.
+VARIANTS = {"": None}
+if FOVEATE:
+    VARIANTS["__fov"] = foveate
 
 
 def reduce_activation(act, bs):
@@ -115,6 +166,8 @@ def build_hooks(model, arch, layers):
 
     if arch.startswith("RN50"):
         v = model.visual
+        # NB: RN50 'stem' and 'layer1..4' are conv stages (GAP-pooled); 'attnpool'
+        # is the attention-pooling head and is therefore labelled separately.
         mods = {"stem": v.avgpool, "layer1": v.layer1, "layer2": v.layer2,
                 "layer3": v.layer3, "layer4": v.layer4, "attnpool": v.attnpool}
         names = layers
@@ -130,12 +183,48 @@ def build_hooks(model, arch, layers):
     return feats, handles, names
 
 
+def probe_native_dims(train_items):
+    """Point #1: record every layer's native dimension (just before PCA).
+
+    Runs a tiny 2-image batch through each network and reads the pooled size of
+    each tapped layer. For ViT taps this is the CLS-token dimension; for RN50 it
+    is the channel count of the GAP-pooled conv stage (with attnpool separate).
+    Returns a list of (network, layer, native_dim, post_pca_dim) rows.
+    """
+    sample = train_items[:2]
+    rows = []
+    for arch, layers in NETWORKS.items():
+        model, _, preprocess = open_clip.create_model_and_transforms(arch, pretrained="openai")
+        model.eval().to(DEVICE)
+        feats, handles, names = build_hooks(model, arch, layers)
+
+        imgs = [preprocess(Image.open(image_path("train", c, f)).convert("RGB"))
+                for c, f in sample]
+        x = torch.stack(imgs).to(DEVICE)
+        feats.clear()
+        with torch.no_grad():
+            model.visual(x)
+        bs = x.shape[0]
+
+        tag = arch.replace("-quickgelu", "")
+        for nm in names:
+            native = int(reduce_activation(feats[nm], bs).shape[1])
+            rows.append((tag, str(nm), native, min(PCA_DIM, native)))
+
+        for h in handles:
+            h.remove()
+        del model
+        torch.cuda.empty_cache()
+    return rows
+
+
 @torch.no_grad()   # we are only reading the network, never training it
-def extract_split(model, preprocess, arch, items, split, names, feats):
+def extract_split(model, preprocess, arch, items, split, names, feats, transform=None):
     """Run all images of one split through the network and collect the tapped outputs.
 
-    Note the key trick: model.visual(x) is run only to make the hooks fire.
-    Its return value is ignored; the data we want lands in `feats` as a side effect.
+    If `transform` is given (e.g. foveate), it is applied to each image before
+    preprocessing. The key trick: model.visual(x) is run only to make the hooks
+    fire; its return value is ignored, the data lands in `feats` as a side effect.
     """
     if LIMIT:
         items = items[:LIMIT]
@@ -144,60 +233,87 @@ def extract_split(model, preprocess, arch, items, split, names, feats):
 
     for s in range(0, n, BATCH):
         batch = items[s:s + BATCH]
-        # Open and preprocess this batch of images.
-        imgs = [preprocess(Image.open(image_path(split, c, f)).convert("RGB"))
-                for c, f in batch]
+        imgs = []
+        for c, f in batch:
+            img = Image.open(image_path(split, c, f)).convert("RGB")
+            if transform is not None:
+                img = transform(img)
+            imgs.append(preprocess(img))
         x = torch.stack(imgs).to(DEVICE)
 
         feats.clear()        # clear last batch's outputs
         model.visual(x)      # run the vision tower -> hooks fill `feats`
         bs = x.shape[0]      # actual batch size (last batch may be smaller)
 
-        # Pool each tapped layer's output and move it to CPU as a NumPy array.
         for nm in names:
             buf[nm].append(reduce_activation(feats[nm], bs).float().cpu().numpy())
 
         if (s // BATCH) % 20 == 0:
             print(f"  [{arch}/{split}] {s + bs}/{n}", flush=True)
 
-    # Glue the per-batch chunks into one array per layer: shape (n_images, dim).
     return {nm: np.concatenate(buf[nm], 0) for nm in names}
 
 
 def main():
-    print("device:", DEVICE, "| LIMIT:", LIMIT, flush=True)
+    print("device:", DEVICE, "| LIMIT:", LIMIT, "| variants:", list(VARIANTS), flush=True)
     train_items, test_items = load_metadata()
     print(f"train {len(train_items)} | test {len(test_items)}", flush=True)
 
+    # ---- Point #1: dimensionality table + PCA sanity check (before any heavy work) ----
+    dim_rows = probe_native_dims(train_items)
+    dim_csv = os.path.join(OUT_DIR, "layer_dimensions.csv")
+    with open(dim_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["network", "layer", "native_dim", "post_pca_dim"])
+        w.writerows(dim_rows)
+
+    print("\n=== Layer dimensionality (native -> post-PCA) ===", flush=True)
+    print(f"{'network':14s} {'layer':10s} {'native':>7s} {'post_pca':>9s}", flush=True)
+    for net, layer, native, post in dim_rows:
+        print(f"{net:14s} {layer:10s} {native:7d} {post:9d}", flush=True)
+    print("saved ->", dim_csv, flush=True)
+
+    # Stop (do not silently proceed) if any layer is narrower than the PCA target,
+    # because PCA cannot expand dimensions and the PCA target then needs revising.
+    smallest = min(native for _, _, native, _ in dim_rows)
+    offenders = [(n, l, d) for n, l, d, _ in dim_rows if d < PCA_DIM]
+    if offenders:
+        msg = ", ".join(f"{n}/{l}={d}" for n, l, d in offenders)
+        raise SystemExit(
+            f"\n[STOP] PCA_DIM={PCA_DIM} exceeds the native dimension of: {msg}.\n"
+            f"        Smallest native dimension is {smallest}. PCA cannot expand "
+            f"dimensions, so either lower PCA_DIM to <= {smallest}, or drop these "
+            f"shallow layers. Set the PCA target with the supervisor, then re-run.")
+
+    # ---- Feature extraction (sharp + foveated variants) ----
     for arch, layers in NETWORKS.items():
         print(f"\n=== {arch} ===", flush=True)
-
-        # Load the network (vision + text), keep it in eval mode on the GPU.
         model, _, preprocess = open_clip.create_model_and_transforms(arch, pretrained="openai")
         model.eval().to(DEVICE)
-
-        # Attach hooks, extract both splits, then remove the hooks.
         feats, handles, names = build_hooks(model, arch, layers)
-        tr = extract_split(model, preprocess, arch, train_items, "train", names, feats)
-        te = extract_split(model, preprocess, arch, test_items,  "test",  names, feats)
+        tag = arch.replace("-quickgelu", "")
+
+        for suffix, transform in VARIANTS.items():
+            label = "sharp" if suffix == "" else "foveated"
+            print(f"  -- variant: {label} --", flush=True)
+            tr = extract_split(model, preprocess, arch, train_items, "train", names, feats, transform)
+            te = extract_split(model, preprocess, arch, test_items,  "test",  names, feats, transform)
+
+            # PCA fit on train, applied to test (no leakage). Saved per variant.
+            for nm in names:
+                pca = PCA(n_components=min(PCA_DIM, tr[nm].shape[1], tr[nm].shape[0]))
+                Xtr = pca.fit_transform(tr[nm]).astype(np.float32)
+                Xte = pca.transform(te[nm]).astype(np.float32)
+                np.save(os.path.join(OUT_DIR, f"{tag}__{nm}{suffix}__train.npy"), Xtr)
+                np.save(os.path.join(OUT_DIR, f"{tag}__{nm}{suffix}__test.npy"),  Xte)
+                print(f"    {tag}__{nm}{suffix}: train{Xtr.shape} test{Xte.shape} "
+                      f"(raw {tr[nm].shape[1]}, var {pca.explained_variance_ratio_.sum():.3f})",
+                      flush=True)
+            del tr, te
+
         for h in handles:
             h.remove()
-
-        # PCA-reduce each layer to 512 dims and save. PCA is FIT on train only,
-        # then APPLIED to test, so no test information leaks into the reduction.
-        tag = arch.replace("-quickgelu", "")
-        for nm in names:
-            pca = PCA(n_components=min(PCA_DIM, tr[nm].shape[1], tr[nm].shape[0]))
-            Xtr = pca.fit_transform(tr[nm]).astype(np.float32)
-            Xte = pca.transform(te[nm]).astype(np.float32)
-            np.save(os.path.join(OUT_DIR, f"{tag}__{nm}__train.npy"), Xtr)
-            np.save(os.path.join(OUT_DIR, f"{tag}__{nm}__test.npy"),  Xte)
-            print(f"  {tag}__{nm}: train{Xtr.shape} test{Xte.shape} "
-                  f"(raw {tr[nm].shape[1]}, var {pca.explained_variance_ratio_.sum():.3f})",
-                  flush=True)
-
-        # Free the network before loading the next one.
-        del model, tr, te
+        del model
         torch.cuda.empty_cache()
 
     print("\nALL DONE", flush=True)

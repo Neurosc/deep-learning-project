@@ -67,6 +67,34 @@ print("channels :", len(ch), "| stim removed:", "stim" not in ch)
 print("times    :", round(float(times.min()), 3), "..", round(float(times.max()), 3),
       "s | onset idx:", int(np.argmin(np.abs(times))))   # onset = sample nearest time 0
 
+# ---------------------------------------------------------------------------
+# Downsampling verification (point #2)
+# ---------------------------------------------------------------------------
+# The THINGS-EEG2 preprocessed files are already at 100 Hz. This script does NOT
+# decimate or resample on top of that -- it only drops the stim channel and
+# averages repetitions. We verify the native rate here so any accidental
+# resampling (introduced upstream or by a future edit) is caught immediately.
+EXPECTED_SFREQ  = 100   # Hz, the dataset's native preprocessed sampling rate
+EXPECTED_NTIMES = 100   # time points per trial
+EXPECTED_NCHAN  = 63    # channels remaining after dropping 'stim'
+WINDOW_SAMPLES  = 10    # samples per 100 ms window (100 Hz -> 10 ms per sample)
+
+dt      = float(np.median(np.diff(times)))   # seconds between consecutive samples
+sfreq   = 1.0 / dt
+n_times = train_avg.shape[2]
+print(f"sampling : dt={dt*1000:.2f} ms -> {sfreq:.1f} Hz | n_times={n_times}")
+
+assert abs(sfreq - EXPECTED_SFREQ) < 1.0, \
+    f"expected ~{EXPECTED_SFREQ} Hz but found {sfreq:.2f} Hz -- has the data been resampled?"
+assert n_times == EXPECTED_NTIMES, \
+    f"expected {EXPECTED_NTIMES} time points but found {n_times} -- has the data been decimated?"
+assert train_avg.shape[1] == EXPECTED_NCHAN, \
+    f"expected {EXPECTED_NCHAN} channels but found {train_avg.shape[1]}"
+
+# A 100 ms decoder window therefore carries 63 channels x 10 samples = 630 inputs.
+print(f"verified : {EXPECTED_NCHAN} channels x {WINDOW_SAMPLES} samples = "
+      f"{EXPECTED_NCHAN * WINDOW_SAMPLES} decoder inputs per 100 ms window (no resampling)")
+
 # Save the prepared arrays for steps 02/03 to use.
 np.save(os.path.join(OUT_DIR, "sub-01_train_avg.npy"), train_avg)
 np.save(os.path.join(OUT_DIR, "sub-01_test_avg.npy"),  test_avg)
