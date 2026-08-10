@@ -23,29 +23,42 @@ analysis across subjects is the natural next step for establishing robustness.
 
 ## EEG preprocessing as realised
 
-The preprocessing performed here is deliberately minimal because the public files
-are already cleaned and epoched. For each subject the preprocessed array has the
-shape image × repetition × channel × time. Two operations are applied. First, the
-non-brain stimulus-trigger channel, labelled "stim", is removed, leaving the 63
-genuine EEG channels. Second, the repetitions of each image are averaged, which
-suppresses the trial-to-trial noise that dominates single EEG trials while
-preserving the stimulus-locked response; this averaging is the reason the test
-set, with eighty repetitions, yields cleaner signals than the training set with
-four. The result is one averaged trace per image, of shape 16,540 × 63 × 100 for
-training and 200 × 63 × 100 for test.
+The public files are already cleaned and epoched, so preprocessing is minimal.
+Each subject's array has the shape image × repetition × channel × time, and two
+operations are applied. First, the non-brain stimulus-trigger channel ("stim") is
+removed, leaving 63 genuine EEG channels. Second, the repetitions of each image
+are averaged, which cancels trial-to-trial noise while preserving the
+stimulus-locked response; this is why the test set (eighty repetitions) yields
+cleaner signals than the training set (four). The result is one averaged trace per
+image: 16,540 × 63 × 100 for training and 200 × 63 × 100 for test.
 
-The temporal axis carries 100 samples. The data are sampled at the dataset's
-native 100 Hz, that is one sample every 10 ms, and no further decimation or
-resampling is applied on top of this; the preparation script verifies the rate
-explicitly and halts if it is not 100 Hz, and confirms that 100 time points
-remain. Stimulus onset falls at the sample nearest time zero, which is sample
-index 20. The decoding analysis slices these 100 samples into nine non-
-overlapping 100 ms windows: a pre-stimulus baseline spanning samples 10 to 20
-(−100 to 0 ms), which serves as a control expected to perform at chance, followed
-by eight post-stimulus windows covering 0–100, 100–200, 200–300, 300–400,
-400–500, 500–600, 600–700 and 700–800 ms. Because each window is ten samples wide
-and 63 channels are retained, the decoder input for one window is 63 × 10 = 630
-dimensions; the training script asserts this 630-dimensional shape at startup.
+The temporal axis has 100 samples at the dataset's native 100 Hz — one sample
+every 10 ms, with no further resampling. The preparation script halts unless the
+rate is 100 Hz and exactly 100 time points remain. Sample 0 is not the stimulus
+onset; it is the start of the recorded epoch, 200 ms before the image. The image
+appears at sample 20 (time 0): everything before it is pre-stimulus baseline,
+everything after is the brain's response.
+
+The decoding analysis slices the 100 samples into nine non-overlapping 100 ms
+windows. The first is a pre-stimulus baseline (samples 10–20, −100 to 0 ms); the
+other eight are post-stimulus, covering 0–100 ms through 700–800 ms. Each window
+is ten samples × 63 channels = 630 dimensions, and the training script asserts
+this shape at startup.
+
+The baseline window is meant to fail, and that is the point of including it.
+Because it sits entirely before the image, the brain holds no response to the
+stimulus yet, so a decoder applied there should score at chance (no better than
+random guessing). If it instead scores above chance, something has leaked — for
+example information bleeding between the training and test sets, a labelling
+error, or improper normalization — because no real stimulus information can exist
+before onset. A successful baseline failure is therefore the evidence that the
+post-stimulus decoding is real and not an artifact.
+
+The baseline uses samples 10–20 rather than the full pre-onset stretch (0–20) for
+two reasons. First, every window must be the same ten-sample width so the
+comparison is fair, and the natural choice is the 100 ms immediately before onset.
+Second, one baseline control is enough; the earliest samples (0–10, −200 to
+−100 ms) are kept in the data but simply not turned into a window.
 
 ## Vision networks
 
@@ -76,12 +89,8 @@ Each extracted representation is reduced to a fixed length by principal componen
 analysis fitted on the training images and then applied unchanged to the test
 images, so that no test information enters the reduction. The PCA target
 dimension is currently set to 512 and is treated as a single named variable; this
-value is provisional and pending confirmation with the supervisor. Before any
-features are written, the extraction script records the native dimension of every
-tapped layer — the CLS-token dimension for the Vision Transformers and the
-channel count of each global-average-pooled stage for RN50 — and writes them,
-alongside the post-PCA dimension, to `features/layer_dimensions.csv`, which should
-be consulted for the authoritative per-layer figures. The script asserts that the
+value is provisionaland we are not so sure if this will make a problem.
+ The script asserts that the
 smallest native dimension is at least the PCA target and stops rather than
 proceeding silently if any layer is narrower than the target, because PCA cannot
 expand dimensionality and the target would then need to be revised. The shallow

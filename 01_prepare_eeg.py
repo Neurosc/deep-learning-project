@@ -1,103 +1,456 @@
 """
 01_prepare_eeg.py
 =================
-Prepare one subject's EEG for decoding. Run AFTER 00_precheck.py.
+Prepare one subject's already-preprocessed EEG for decoding.
 
-INPUT (from the THINGS-EEG2 dataset):
-    ~/things_eeg/eeg_data/sub-01_63/sub-01__63_channels/preprocessed_eeg_training.npy
-    ~/things_eeg/eeg_data/sub-01_63/sub-01__63_channels/preprocessed_eeg_test.npy
-    Each file stores a dict whose 'preprocessed_eeg_data' array has shape
-    [image, repetition, channel, time].
+Run AFTER:
+    00_precheck.py
 
-WHAT IT DOES:
-    1. Drops the non-brain 'stim' trigger channel (64 -> 63 channels).
-    2. Averages over the repetitions of each image (each image was shown several
-       times; averaging cancels random noise and keeps the brain's response to
-       the image).
+INPUT:
+    ~/things_eeg/preprocessed_data/
+        Preprocessed_data_250Hz_whiten/
+        sub-01/
+            train.pt
+            test.pt
 
-OUTPUT (written to ~/things_eeg/eeg_prepared/):
-    sub-01_train_avg.npy   shape (16540, 63, 100)   one clean trace per training image
-    sub-01_test_avg.npy    shape (200,   63, 100)   one clean trace per test image
-    eeg_channels.npy       the 63 channel names
-    eeg_times.npy          the 100 time points, in seconds (used to define windows)
+The preprocessing pipeline has already:
+    1. Removed the non-brain stim channel.
+    2. Epoched the EEG from 0 to approximately 1 second.
+    3. Applied baseline correction.
+    4. Resampled the EEG from 1000 Hz to 250 Hz.
+    5. Applied MVNN whitening.
+    6. Averaged the repetitions belonging to each image.
 
-Note: the EEG has 100 time points spaced 10 ms apart, with the image appearing
-at the sample closest to time 0 (the "onset"). Step 03 slices these 100 points
-into time windows (0-100 ms, 100-200 ms, ...).
+Expected input shapes:
+    train EEG: [16540, 63, 250]
+    test EEG:  [200,   63, 250]
+
+WHAT THIS SCRIPT DOES:
+    1. Loads the new .pt files.
+    2. Verifies EEG shapes, channels, sampling frequency and time points.
+    3. Verifies that the data contain no NaN or infinite values.
+    4. Saves NumPy arrays for the later extraction/alignment pipelines.
+
+OUTPUT:
+    ~/things_eeg/eeg_prepared/
+        sub-01_train_avg.npy
+        sub-01_test_avg.npy
+        eeg_channels.npy
+        eeg_times.npy
 
 Usage:
     python 01_prepare_eeg.py
 """
 
 import os
+
 import numpy as np
+import torch
 
-ROOT    = os.path.expanduser("~/things_eeg")
-EEG_DIR = os.path.join(ROOT, "eeg_data/sub-01_63/sub-01__63_channels")
-OUT_DIR = os.path.join(ROOT, "eeg_prepared")
-os.makedirs(OUT_DIR, exist_ok=True)
-
-
-def load_and_average(split):
-    """Load one split ('train' or 'test'), drop the stim channel, average repetitions."""
-    fname = "preprocessed_eeg_training.npy" if split == "train" else "preprocessed_eeg_test.npy"
-    d = np.load(os.path.join(EEG_DIR, fname), allow_pickle=True).item()
-
-    data     = d["preprocessed_eeg_data"]   # [image, repetition, 64, time]
-    ch_names = list(d["ch_names"])
-    times    = np.asarray(d["times"])        # the time (in seconds) of each sample
-
-    # 1) Drop the 'stim' channel: it is a trigger marker, not brain activity.
-    keep   = [i for i, c in enumerate(ch_names) if c != "stim"]
-    data   = data[:, :, keep, :]             # -> [image, repetition, 63, time]
-    eeg_ch = [ch_names[i] for i in keep]
-
-    # 2) Average over the repetition axis (axis=1) -> one trace per image.
-    data_avg = data.mean(axis=1).astype(np.float32)   # -> [image, 63, time]
-    return data_avg, eeg_ch, times
-
-
-# Prepare both splits.
-train_avg, ch, times = load_and_average("train")
-test_avg,  _,  _     = load_and_average("test")
-
-print("train_avg:", train_avg.shape)   # (16540, 63, 100)
-print("test_avg :", test_avg.shape)    # (200, 63, 100)
-print("channels :", len(ch), "| stim removed:", "stim" not in ch)
-print("times    :", round(float(times.min()), 3), "..", round(float(times.max()), 3),
-      "s | onset idx:", int(np.argmin(np.abs(times))))   # onset = sample nearest time 0
 
 # ---------------------------------------------------------------------------
-# Downsampling verification (point #2)
+# Paths
 # ---------------------------------------------------------------------------
-# The THINGS-EEG2 preprocessed files are already at 100 Hz. This script does NOT
-# decimate or resample on top of that -- it only drops the stim channel and
-# averages repetitions. We verify the native rate here so any accidental
-# resampling (introduced upstream or by a future edit) is caught immediately.
-EXPECTED_SFREQ  = 100   # Hz, the dataset's native preprocessed sampling rate
-EXPECTED_NTIMES = 100   # time points per trial
-EXPECTED_NCHAN  = 63    # channels remaining after dropping 'stim'
-WINDOW_SAMPLES  = 10    # samples per 100 ms window (100 Hz -> 10 ms per sample)
 
-dt      = float(np.median(np.diff(times)))   # seconds between consecutive samples
-sfreq   = 1.0 / dt
-n_times = train_avg.shape[2]
-print(f"sampling : dt={dt*1000:.2f} ms -> {sfreq:.1f} Hz | n_times={n_times}")
+ROOT = os.path.expanduser("~/things_eeg")
 
-assert abs(sfreq - EXPECTED_SFREQ) < 1.0, \
-    f"expected ~{EXPECTED_SFREQ} Hz but found {sfreq:.2f} Hz -- has the data been resampled?"
-assert n_times == EXPECTED_NTIMES, \
-    f"expected {EXPECTED_NTIMES} time points but found {n_times} -- has the data been decimated?"
-assert train_avg.shape[1] == EXPECTED_NCHAN, \
-    f"expected {EXPECTED_NCHAN} channels but found {train_avg.shape[1]}"
+EEG_DIR = os.path.join(
+    ROOT,
+    "preprocessed_data",
+    "Preprocessed_data_250Hz_whiten",
+    "sub-01",
+)
 
-# A 100 ms decoder window therefore carries 63 channels x 10 samples = 630 inputs.
-print(f"verified : {EXPECTED_NCHAN} channels x {WINDOW_SAMPLES} samples = "
-      f"{EXPECTED_NCHAN * WINDOW_SAMPLES} decoder inputs per 100 ms window (no resampling)")
+OUT_DIR = os.path.join(
+    ROOT,
+    "eeg_prepared",
+)
 
-# Save the prepared arrays for steps 02/03 to use.
-np.save(os.path.join(OUT_DIR, "sub-01_train_avg.npy"), train_avg)
-np.save(os.path.join(OUT_DIR, "sub-01_test_avg.npy"),  test_avg)
-np.save(os.path.join(OUT_DIR, "eeg_channels.npy"), np.array(ch))
-np.save(os.path.join(OUT_DIR, "eeg_times.npy"),    times)
-print("saved ->", OUT_DIR)
+os.makedirs(
+    OUT_DIR,
+    exist_ok=True,
+)
+
+
+TRAIN_PATH = os.path.join(
+    EEG_DIR,
+    "train.pt",
+)
+
+TEST_PATH = os.path.join(
+    EEG_DIR,
+    "test.pt",
+)
+
+
+# ---------------------------------------------------------------------------
+# Expected data properties
+# ---------------------------------------------------------------------------
+
+EXPECTED_SFREQ = 250
+EXPECTED_NTIMES = 250
+EXPECTED_NCHAN = 63
+
+EXPECTED_NTRAIN = 16540
+EXPECTED_NTEST = 200
+
+# At 250 Hz:
+# one sample = 4 ms
+# 100 ms = 25 samples
+WINDOW_SAMPLES = 25
+
+
+# ---------------------------------------------------------------------------
+# Load one split
+# ---------------------------------------------------------------------------
+
+def load_split(path, split):
+    """
+    Load one already-preprocessed EEG split.
+
+    The EEG is already repetition-averaged and has shape:
+        [image, channel, time]
+    """
+
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"{split} EEG file does not exist: {path}"
+        )
+
+    loaded = torch.load(
+        path,
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    required_keys = {
+        "eeg",
+        "label",
+        "img",
+        "text",
+        "ch_names",
+        "times",
+        "sfreq",
+    }
+
+    missing_keys = required_keys.difference(
+        loaded.keys()
+    )
+
+    if missing_keys:
+        raise KeyError(
+            f"{split} file is missing keys: "
+            f"{sorted(missing_keys)}"
+        )
+
+    eeg = loaded["eeg"]
+    labels = loaded["label"]
+    images = loaded["img"]
+    texts = loaded["text"]
+    ch_names = list(loaded["ch_names"])
+    times = loaded["times"]
+    sfreq = float(loaded["sfreq"])
+
+    if not isinstance(eeg, torch.Tensor):
+        raise TypeError(
+            f"{split} EEG must be a torch.Tensor."
+        )
+
+    if not isinstance(labels, torch.Tensor):
+        raise TypeError(
+            f"{split} labels must be a torch.Tensor."
+        )
+
+    if not isinstance(times, torch.Tensor):
+        times = torch.as_tensor(
+            times,
+            dtype=torch.float32,
+        )
+
+    eeg = eeg.to(torch.float32)
+    times = times.to(torch.float32)
+
+    return {
+        "eeg": eeg,
+        "label": labels,
+        "img": images,
+        "text": texts,
+        "ch_names": ch_names,
+        "times": times,
+        "sfreq": sfreq,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Load training and test data
+# ---------------------------------------------------------------------------
+
+train = load_split(
+    TRAIN_PATH,
+    "train",
+)
+
+test = load_split(
+    TEST_PATH,
+    "test",
+)
+
+
+train_eeg = train["eeg"]
+test_eeg = test["eeg"]
+
+ch_names = train["ch_names"]
+times = train["times"]
+sfreq = train["sfreq"]
+
+
+# ---------------------------------------------------------------------------
+# Shape checks
+# ---------------------------------------------------------------------------
+
+print("train EEG:", tuple(train_eeg.shape))
+print("test EEG :", tuple(test_eeg.shape))
+print("channels :", len(ch_names))
+print("time pts :", len(times))
+print("sfreq    :", sfreq)
+
+
+if train_eeg.ndim != 3:
+    raise ValueError(
+        "Training EEG must have shape "
+        "[image, channel, time], but found "
+        f"{tuple(train_eeg.shape)}."
+    )
+
+if test_eeg.ndim != 3:
+    raise ValueError(
+        "Test EEG must have shape "
+        "[image, channel, time], but found "
+        f"{tuple(test_eeg.shape)}."
+    )
+
+
+assert train_eeg.shape == (
+    EXPECTED_NTRAIN,
+    EXPECTED_NCHAN,
+    EXPECTED_NTIMES,
+), (
+    "Unexpected training EEG shape: "
+    f"{tuple(train_eeg.shape)}"
+)
+
+assert test_eeg.shape == (
+    EXPECTED_NTEST,
+    EXPECTED_NCHAN,
+    EXPECTED_NTIMES,
+), (
+    "Unexpected test EEG shape: "
+    f"{tuple(test_eeg.shape)}"
+)
+
+
+# ---------------------------------------------------------------------------
+# Metadata checks
+# ---------------------------------------------------------------------------
+
+assert test["ch_names"] == ch_names, (
+    "Training and test channel orders differ."
+)
+
+assert np.isclose(
+    test["sfreq"],
+    sfreq,
+), (
+    "Training and test sampling frequencies differ."
+)
+
+assert torch.allclose(
+    test["times"],
+    times,
+), (
+    "Training and test time vectors differ."
+)
+
+assert len(train["label"]) == EXPECTED_NTRAIN
+assert len(train["img"]) == EXPECTED_NTRAIN
+assert len(train["text"]) == EXPECTED_NTRAIN
+
+assert len(test["label"]) == EXPECTED_NTEST
+assert len(test["img"]) == EXPECTED_NTEST
+assert len(test["text"]) == EXPECTED_NTEST
+
+
+# ---------------------------------------------------------------------------
+# Channel checks
+# ---------------------------------------------------------------------------
+
+assert len(ch_names) == EXPECTED_NCHAN, (
+    f"Expected {EXPECTED_NCHAN} channels, "
+    f"but found {len(ch_names)}."
+)
+
+assert "stim" not in ch_names, (
+    "The stim trigger channel is still present."
+)
+
+
+# ---------------------------------------------------------------------------
+# Sampling checks
+# ---------------------------------------------------------------------------
+
+times_np = times.cpu().numpy()
+
+dt = float(
+    np.median(
+        np.diff(times_np)
+    )
+)
+
+calculated_sfreq = 1.0 / dt
+
+
+print(
+    "times     :",
+    round(float(times_np.min()), 3),
+    "..",
+    round(float(times_np.max()), 3),
+    "seconds",
+)
+
+print(
+    f"sampling  : dt={dt * 1000:.2f} ms "
+    f"-> {calculated_sfreq:.1f} Hz"
+)
+
+
+assert abs(
+    calculated_sfreq - EXPECTED_SFREQ
+) < 1.0, (
+    f"Expected approximately {EXPECTED_SFREQ} Hz, "
+    f"but calculated {calculated_sfreq:.2f} Hz."
+)
+
+assert abs(
+    sfreq - EXPECTED_SFREQ
+) < 1.0, (
+    f"Saved sfreq is {sfreq}, but "
+    f"{EXPECTED_SFREQ} Hz was expected."
+)
+
+assert train_eeg.shape[-1] == EXPECTED_NTIMES
+assert test_eeg.shape[-1] == EXPECTED_NTIMES
+assert len(times_np) == EXPECTED_NTIMES
+
+
+# ---------------------------------------------------------------------------
+# Data validity checks
+# ---------------------------------------------------------------------------
+
+assert torch.isfinite(
+    train_eeg
+).all(), (
+    "Training EEG contains NaN or infinite values."
+)
+
+assert torch.isfinite(
+    test_eeg
+).all(), (
+    "Test EEG contains NaN or infinite values."
+)
+
+
+print(
+    "train mean/std:",
+    float(train_eeg.mean()),
+    float(train_eeg.std()),
+)
+
+print(
+    "test mean/std :",
+    float(test_eeg.mean()),
+    float(test_eeg.std()),
+)
+
+
+# ---------------------------------------------------------------------------
+# Decoder input dimensionality
+# ---------------------------------------------------------------------------
+
+window_inputs = (
+    EXPECTED_NCHAN
+    * WINDOW_SAMPLES
+)
+
+full_epoch_inputs = (
+    EXPECTED_NCHAN
+    * EXPECTED_NTIMES
+)
+
+
+print(
+    f"100 ms window: "
+    f"{EXPECTED_NCHAN} channels x "
+    f"{WINDOW_SAMPLES} samples = "
+    f"{window_inputs} decoder inputs"
+)
+
+print(
+    f"full 1-second epoch: "
+    f"{EXPECTED_NCHAN} channels x "
+    f"{EXPECTED_NTIMES} samples = "
+    f"{full_epoch_inputs} decoder inputs"
+)
+
+
+# ---------------------------------------------------------------------------
+# Save arrays for later pipelines
+# ---------------------------------------------------------------------------
+
+train_np = train_eeg.cpu().numpy().astype(
+    np.float32,
+)
+
+test_np = test_eeg.cpu().numpy().astype(
+    np.float32,
+)
+
+
+np.save(
+    os.path.join(
+        OUT_DIR,
+        "sub-01_train_avg.npy",
+    ),
+    train_np,
+)
+
+np.save(
+    os.path.join(
+        OUT_DIR,
+        "sub-01_test_avg.npy",
+    ),
+    test_np,
+)
+
+np.save(
+    os.path.join(
+        OUT_DIR,
+        "eeg_channels.npy",
+    ),
+    np.asarray(ch_names),
+)
+
+np.save(
+    os.path.join(
+        OUT_DIR,
+        "eeg_times.npy",
+    ),
+    times_np.astype(np.float32),
+)
+
+
+print("\nsaved ->", OUT_DIR)
+print("sub-01_train_avg.npy:", train_np.shape)
+print("sub-01_test_avg.npy :", test_np.shape)
+print("eeg_channels.npy    :", len(ch_names))
+print("eeg_times.npy       :", times_np.shape)
+print("\nEEG PREPARATION COMPLETED SUCCESSFULLY")

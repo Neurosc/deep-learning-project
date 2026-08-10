@@ -5,322 +5,1101 @@ The main experiment. Train a small model to predict each image's network feature
 from the brain signal, for every (feature set x time window) combination, and
 record how well it works. Run AFTER 01_prepare_eeg.py and 02_extract_features.py.
 
-IDEA: if the brain processes a glimpsed image in stages (simple features first,
-meaning later), then early time windows of the EEG should best match the early
-network layers, and late time windows should best match the deep layers.
-
-MULTIPLE SEEDS: training involves randomness (weights, validation split, batch
-order). We run the whole experiment over several seeds and average, to check the
-early->late pattern is real and not a fluke of one lucky random start.
-
-This file also covers:
-  #2  asserts the decoder input for a 100 ms window is 63 ch x 10 samples = 630.
-  #3  records train AND validation loss at every epoch (overfitting check).
-  #4  a single-condition sanity routine reporting val/test loss + top-1/top-5.
-  #5  saves top-1/top-5 for the deepest, most semantic layer (literature number).
-  It auto-discovers every feature set in features/, so the sharp and foveated
-  variants from 02 are both trained and end up in the same results file (#6).
-
-OUTPUT (in ~/things_eeg/results/):
-    alignment_sub-01_seeds.csv   one row per (target, window, seed)
-    alignment_sub-01.csv         averaged over seeds (step 04 reads this)
-    epoch_traces_sub-01.csv      train & val loss per epoch (for the overfitting plot)
-    object_perception_sub-01.csv top-1/top-5 for the deepest layer, per window
+Changes in this version:
+    1. EEG is now 250 Hz, so each 100 ms window contains 25 samples.
+    2. Uses EEGProjectLayer with a standard residual connection and LayerNorm.
+    3. Uses a learnable contrastive temperature.
+    4. Saves train/validation loss, top-1, top-5, learning rate and temperature
+       for every epoch using pandas.
+    5. Runs one full 1-second sanity check.
 
 Usage:
     python 03_run_alignment.py
-    # Runtime scales with targets x windows x seeds; launch with nohup overnight.
 """
 
 import os
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "3")   # choose GPU before importing torch
-import glob, csv, time
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "3")
+
+import glob
+import csv
+import time
 import numpy as np
-import torch, torch.nn as nn, torch.nn.functional as F
+import pandas as pd                          # CHANGED: pandas epoch log
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 from torch.utils.data import Dataset, DataLoader
+
 
 ROOT     = os.path.expanduser("~/things_eeg")
 EEG_DIR  = os.path.join(ROOT, "eeg_prepared")
 FEAT_DIR = os.path.join(ROOT, "features")
-RES_DIR  = os.path.join(ROOT, "results"); os.makedirs(RES_DIR, exist_ok=True)
-OUT_CSV       = os.path.join(RES_DIR, "alignment_sub-01.csv")          # averaged
-OUT_CSV_SEEDS = os.path.join(RES_DIR, "alignment_sub-01_seeds.csv")    # per-seed
-EPOCH_CSV     = os.path.join(RES_DIR, "epoch_traces_sub-01.csv")       # per-epoch traces (#3)
-OBJ_CSV       = os.path.join(RES_DIR, "object_perception_sub-01.csv")  # deepest-layer acc (#5)
+RES_DIR  = os.path.join(ROOT, "results")
+os.makedirs(RES_DIR, exist_ok=True)
+
+OUT_CSV       = os.path.join(RES_DIR, "alignment_sub-01_lr1e-4.csv")
+OUT_CSV_SEEDS = os.path.join(RES_DIR, "alignment_sub-01_seeds_lr1e-4.csv")
+EPOCH_CSV     = os.path.join(RES_DIR, "epoch_traces_sub-01_lr1e-4.csv")
+OBJ_CSV       = os.path.join(RES_DIR, "object_perception_sub-01_lr1e-4.csv")
+SANITY_CSV    = os.path.join(RES_DIR, "sanity_check_sub-01_lr1e-4.csv")
+
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-SEEDS  = [0, 1, 2, 3, 4]    # the random seeds to run and average over
-EPOCHS, BATCH = 50, 256
 
-EXPECTED_NCHAN  = 63     # EEG channels after dropping 'stim' (verified in step 01)
-WINDOW_SAMPLES  = 10     # samples per 100 ms window (100 Hz -> 10 ms per sample)
-DEEP_LAYER = "ViT-L-14__block24"   # deepest / most semantic layer (for points #4, #5)
+SEEDS = [0, 1, 2, 3, 4]
 
-# Each window is a (start, end) range over the 100 EEG time points (10 ms each).
-# Sample 20 is stimulus onset (time 0), so e.g. (30,40) = 100-200 ms after onset.
+EPOCHS = 50
+BATCH  = 256
+
+EXPECTED_NCHAN  = 63
+EXPECTED_NTIMES = 250                       # CHANGED
+WINDOW_SAMPLES  = 25                        # CHANGED: 100 ms at 250 Hz
+
+DEEP_LAYER = "ViT-L-14__block24"
+
+
+# ---------------------------------------------------------------------------
+# EEG windows
+# ---------------------------------------------------------------------------
+
+# CHANGED:
+# The prepared EEG starts at 0 seconds and contains 250 samples.
+# At 250 Hz, 25 samples correspond to 100 ms.
+#
+# There is no baseline window because the prepared arrays contain only
+# 0 to approximately 996 ms after stimulus onset.
 WINDOWS = {
-    "baseline": (10, 20),   # -100..0 ms, before the image -> control, should be at chance
-    "0_100":    (20, 30),
-    "100_200":  (30, 40),
-    "200_300":  (40, 50),
-    "300_400":  (50, 60),
-    "400_500":  (60, 70),
-    "500_600":  (70, 80),
-    "600_700":  (80, 90),
-    "700_800":  (90, 100),
+    "0_100":     (0, 25),
+    "100_200":   (25, 50),
+    "200_300":   (50, 75),
+    "300_400":   (75, 100),
+    "400_500":   (100, 125),
+    "500_600":   (125, 150),
+    "600_700":   (150, 175),
+    "700_800":   (175, 200),
+    "800_900":   (200, 225),
+    "900_1000":  (225, 250),
 }
+
+# CHANGED:
+# Used only for the full temporal-resolution sanity check.
+FULL_WINDOW = (0, 250)
 
 
 class EEGDataset(Dataset):
     """Pair each image's EEG window with that image's target feature vector."""
+
     def __init__(self, eeg, targets, window):
         s, e = window
-        self.eeg     = torch.from_numpy(eeg[:, :, s:e]).float()   # [N, 63, window_len]
-        self.targets = torch.from_numpy(targets).float()          # [N, feature_dim]
+
+        self.eeg = torch.from_numpy(
+            eeg[:, :, s:e]
+        ).float()
+
+        self.targets = torch.from_numpy(
+            targets
+        ).float()
+
     def __len__(self):
         return len(self.eeg)
+
     def __getitem__(self, i):
         return self.eeg[i], self.targets[i]
 
 
-class EEGDecoder(nn.Module):
-    """A 2-layer MLP with a residual (skip) connection.
+# ---------------------------------------------------------------------------
+# EEGProjectLayer
+# ---------------------------------------------------------------------------
 
-    Flattens the EEG window to one long vector, passes it through two linear
-    layers (with GELU activation and dropout), and adds a direct linear shortcut.
-    Output length = the feature vector's length.
-    """
-    def __init__(self, input_size, output_size, hidden_size=1024):
+# CHANGED:
+# Standard residual connection:
+#
+# output = x + function(x)
+#
+# Unlike the old architecture, the residual branch does not use a separate
+# linear transformation of the original EEG input.
+class ResidualAdd(nn.Module):
+
+    def __init__(self, function):
         super().__init__()
-        self.layer1   = nn.Linear(input_size, hidden_size)
-        self.layer2   = nn.Linear(hidden_size, output_size)
-        self.gelu     = nn.GELU()
-        self.dropout  = nn.Dropout(0.1)
-        self.residual = nn.Linear(input_size, output_size)
+        self.function = function
+
     def forward(self, x):
-        x   = x.view(x.shape[0], -1)                      # flatten [N, 63, win] -> [N, 63*win]
-        out = self.dropout(self.gelu(self.layer1(x)))
-        out = self.layer2(out)
-        return out + self.residual(x)
+        return x + self.function(x)
 
 
-def info_nce(a, b, t=0.07):
-    """Symmetric InfoNCE contrastive loss.
-
-    Normalises both sets of vectors, builds a similarity matrix, and rewards each
-    EEG (row) for being most similar to its own image's feature (the diagonal),
-    in both directions (EEG->feature and feature->EEG). t is the temperature.
+# CHANGED:
+# This replaces EEGDecoder, LinearDecoder and make_decoder.
+class EEGProjectLayer(nn.Module):
     """
+    Project flattened EEG into the image-feature space.
+
+    Structure:
+        EEG
+        -> flatten
+        -> Linear(input_size, output_size)
+        -> residual block
+        -> LayerNorm
+
+    The model also stores a learnable logit scale. This is equivalent to
+    learning the temperature used by InfoNCE.
+    """
+
+    def __init__(self, input_size, output_size, dropout=0.3):
+        super().__init__()
+
+        self.input_size = input_size
+
+        self.project = nn.Sequential(
+            nn.Linear(input_size, output_size),
+
+            ResidualAdd(
+                nn.Sequential(
+                    nn.GELU(),
+                    nn.Linear(output_size, output_size),
+                    nn.Dropout(dropout),
+                )
+            ),
+
+            nn.LayerNorm(output_size),
+        )
+
+        # Start from the old temperature value, 0.07.
+        #
+        # scale = 1 / temperature
+        # logit_scale = log(1 / temperature)
+        self.logit_scale = nn.Parameter(
+            torch.tensor(
+                np.log(1.0 / 0.07),
+                dtype=torch.float32,
+            )
+        )
+
+    def forward(self, x):
+        x = x.reshape(x.shape[0], self.input_size)
+        return self.project(x)
+
+    def temperature(self):
+        """Return the current learned temperature."""
+
+        scale = self.logit_scale.exp().clamp(max=100.0)
+        return 1.0 / scale
+
+
+# ---------------------------------------------------------------------------
+# Contrastive loss
+# ---------------------------------------------------------------------------
+
+# CHANGED:
+# The fixed t=0.07 argument has been removed.
+# logit_scale is learned by EEGProjectLayer.
+def info_nce(a, b, logit_scale):
+    """Symmetric InfoNCE contrastive loss with learnable temperature."""
+
     a = F.normalize(a, dim=-1)
     b = F.normalize(b, dim=-1)
-    logits = a @ b.t() / t
-    lab = torch.arange(len(a), device=a.device)
-    return 0.5 * (F.cross_entropy(logits, lab) + F.cross_entropy(logits.t(), lab))
+
+    scale = logit_scale.exp().clamp(max=100.0)
+
+    logits = scale * (a @ b.t())
+
+    labels = torch.arange(
+        len(a),
+        device=a.device,
+    )
+
+    return 0.5 * (
+        F.cross_entropy(logits, labels)
+        + F.cross_entropy(logits.t(), labels)
+    )
 
 
 def retrieval_accuracy(pred, target, ks=(1, 5)):
-    """Point #4: shared retrieval metric, reused everywhere accuracy is needed.
-
-    For each predicted EEG embedding, rank all target features by cosine
-    similarity and check whether the correct one is within the top k. Returns a
-    dict {1: top1, 5: top5}. (Chance for 200 test images is 1/200 and 5/200.)
     """
-    p = F.normalize(pred, dim=-1)
-    t = F.normalize(target, dim=-1)
-    sims = p @ t.t()
-    n = sims.shape[0]
-    idx = torch.arange(n, device=sims.device)
-    out = {}
+    For each predicted EEG embedding, rank all target features by cosine
+    similarity and check whether the correct target is within the top k.
+    """
+
+    pred = F.normalize(pred, dim=-1)
+    target = F.normalize(target, dim=-1)
+
+    similarities = pred @ target.t()
+
+    n = similarities.shape[0]
+
+    correct_index = torch.arange(
+        n,
+        device=similarities.device,
+    )
+
+    output = {}
+
     for k in ks:
-        kk = min(k, n)
-        hit = (sims.topk(kk, dim=1).indices == idx[:, None]).any(1).float().mean().item()
-        out[k] = hit
-    return out
+        actual_k = min(k, n)
+
+        retrieved = similarities.topk(
+            actual_k,
+            dim=1,
+        ).indices
+
+        hit = (
+            retrieved == correct_index[:, None]
+        ).any(dim=1)
+
+        output[k] = hit.float().mean().item()
+
+    return output
 
 
-def to_batch(eeg, tgt, window):
-    """Slice the time window and move the whole set to the GPU as two tensors."""
+def to_batch(eeg, target, window):
+    """Slice one EEG window and move the complete set to the GPU."""
+
     s, e = window
-    return (torch.from_numpy(eeg[:, :, s:e]).float().to(DEVICE),
-            torch.from_numpy(tgt).float().to(DEVICE))
+
+    eeg_tensor = torch.from_numpy(
+        eeg[:, :, s:e]
+    ).float().to(DEVICE)
+
+    target_tensor = torch.from_numpy(
+        target
+    ).float().to(DEVICE)
+
+    return eeg_tensor, target_tensor
 
 
-def train_one(train_eeg, train_tgt, test_eeg, test_tgt, window, seed):
-    """Train one decoder for one (feature set x window x seed).
+# CHANGED:
+# Shared evaluation function for loss and retrieval accuracy.
+@torch.no_grad()
+def evaluate(model, eeg, target):
+
+    prediction = model(eeg)
+
+    loss = info_nce(
+        prediction,
+        target,
+        model.logit_scale,
+    ).item()
+
+    accuracy = retrieval_accuracy(
+        prediction,
+        target,
+    )
+
+    return loss, accuracy
+
+
+def train_one(
+    train_eeg,
+    train_tgt,
+    test_eeg,
+    test_tgt,
+    window,
+    seed,
+):
+    """
+    Train one EEGProjectLayer for one feature set, window and seed.
 
     Returns:
-        best  : (val_loss, test_loss, best_epoch, top1, top5) at the epoch with
-                lowest validation loss.
-        trace : list of (epoch, train_loss, val_loss) for the overfitting plot (#3).
+        best:
+            val_loss, test_loss, best_epoch, test_top1, test_top5
+
+        trace:
+            per-epoch train/validation metrics
     """
-    # The seed fixes ALL randomness for this run: weight init, validation split,
-    # and batch order. Different seeds = different random starts.
+
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    # Carve a 10% validation set out of the training images (for epoch selection).
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    # Carve a 10% validation set out of the training images.
     n = len(train_eeg)
-    perm = np.random.permutation(n)
-    nv = n // 10
-    vi, ti = perm[:nv], perm[nv:]
 
-    dl = DataLoader(EEGDataset(train_eeg[ti], train_tgt[ti], window),
-                    batch_size=BATCH, shuffle=True, drop_last=True)
-    ve, vt = to_batch(train_eeg[vi], train_tgt[vi], window)        # validation set
-    te, tt = to_batch(test_eeg, test_tgt, window)                  # test set
-    # A fixed training probe (same size as the validation set) so the per-epoch
-    # train and val losses are on the same scale and directly comparable (#3).
-    tpe, tpt = to_batch(train_eeg[ti[:nv]], train_tgt[ti[:nv]], window)
+    permutation = np.random.permutation(n)
 
-    in_dim  = train_eeg.shape[1] * (window[1] - window[0])    # 63 * window length
-    out_dim = train_tgt.shape[1]                              # feature length (e.g. 512)
-    model = EEGDecoder(in_dim, out_dim).to(DEVICE)
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
-    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
+    n_validation = n // 10
 
-    best  = (float("inf"), None, 0, 0.0, 0.0)   # (val, test, epoch, top1, top5)
+    validation_indices = permutation[:n_validation]
+    training_indices   = permutation[n_validation:]
+
+    training_loader = DataLoader(
+        EEGDataset(
+            train_eeg[training_indices],
+            train_tgt[training_indices],
+            window,
+        ),
+        batch_size=BATCH,
+        shuffle=True,
+        drop_last=True,
+    )
+
+    validation_eeg, validation_target = to_batch(
+        train_eeg[validation_indices],
+        train_tgt[validation_indices],
+        window,
+    )
+
+    test_eeg_tensor, test_target_tensor = to_batch(
+        test_eeg,
+        test_tgt,
+        window,
+    )
+
+    # Fixed training probe with the same size as validation.
+    training_probe_indices = training_indices[:n_validation]
+
+    training_probe_eeg, training_probe_target = to_batch(
+        train_eeg[training_probe_indices],
+        train_tgt[training_probe_indices],
+        window,
+    )
+
+    input_dimension = (
+        train_eeg.shape[1]
+        * (window[1] - window[0])
+    )
+
+    output_dimension = train_tgt.shape[1]
+
+    # CHANGED: EEGProjectLayer replaces the old decoder selection.
+    model = EEGProjectLayer(
+        input_size=input_dimension,
+        output_size=output_dimension,
+    ).to(DEVICE)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=1e-4, # changed this to 1e-4 from 1e-3
+        weight_decay=0.01,
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=EPOCHS,
+    )
+
+    best = (
+        float("inf"),
+        None,
+        0,
+        0.0,
+        0.0,
+    )
+
     trace = []
-    for ep in range(1, EPOCHS + 1):
-        # --- train for one epoch ---
+
+    for epoch in range(1, EPOCHS + 1):
+
+        # ---------------------------------------------------------------
+        # Training
+        # ---------------------------------------------------------------
+
         model.train()
-        for eeg, tgt in dl:
-            eeg, tgt = eeg.to(DEVICE), tgt.to(DEVICE)
-            opt.zero_grad()
-            info_nce(model(eeg), tgt).backward()
-            opt.step()
-        sch.step()
 
-        # --- record train + val loss every epoch (overfitting check, #3) ---
+        for eeg_batch, target_batch in training_loader:
+
+            eeg_batch = eeg_batch.to(DEVICE)
+            target_batch = target_batch.to(DEVICE)
+
+            optimizer.zero_grad()
+
+            prediction = model(eeg_batch)
+
+            loss = info_nce(
+                prediction,
+                target_batch,
+                model.logit_scale,
+            )
+
+            loss.backward()
+            optimizer.step()
+
+        scheduler.step()
+
+        # ---------------------------------------------------------------
+        # Per-epoch train and validation logs
+        # ---------------------------------------------------------------
+
         model.eval()
-        with torch.no_grad():
-            tr_loss = info_nce(model(tpe), tpt).item()
-            vl      = info_nce(model(ve),  vt).item()
-        trace.append((ep, tr_loss, vl))
 
-        # If validation improved, snapshot the test loss + retrieval accuracy.
-        if vl < best[0]:
-            with torch.no_grad():
-                tl  = info_nce(model(te), tt).item()
-                acc = retrieval_accuracy(model(te), tt)
-            best = (vl, tl, ep, acc[1], acc[5])
+        train_loss, train_accuracy = evaluate(
+            model,
+            training_probe_eeg,
+            training_probe_target,
+        )
+
+        validation_loss, validation_accuracy = evaluate(
+            model,
+            validation_eeg,
+            validation_target,
+        )
+
+        temperature = float(
+            model.temperature().detach().cpu()
+        )
+
+        learning_rate = optimizer.param_groups[0]["lr"]
+
+        # CHANGED:
+        # More complete per-epoch information.
+        trace.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": validation_loss,
+                "train_top1": train_accuracy[1],
+                "train_top5": train_accuracy[5],
+                "val_top1": validation_accuracy[1],
+                "val_top5": validation_accuracy[5],
+                "temperature": temperature,
+                "learning_rate": learning_rate,
+            }
+        )
+
+        # ---------------------------------------------------------------
+        # Test only when validation improves
+        # ---------------------------------------------------------------
+
+        if validation_loss < best[0]:
+
+            test_loss, test_accuracy = evaluate(
+                model,
+                test_eeg_tensor,
+                test_target_tensor,
+            )
+
+            best = (
+                validation_loss,
+                test_loss,
+                epoch,
+                test_accuracy[1],
+                test_accuracy[5],
+            )
+
     return best, trace
 
 
-def sanity_check(train_eeg, test_eeg, target, window_name, seed=0):
-    """Point #4: train ONE decoder for a chosen (network/layer, window) and report
-    validation loss, test loss, and top-1/top-5 together, so we can confirm that
-    loss and retrieval accuracy move together."""
-    train_tgt = np.load(os.path.join(FEAT_DIR, f"{target}__train.npy"))
-    test_tgt  = np.load(os.path.join(FEAT_DIR, f"{target}__test.npy"))
-    (vl, tl, ep, top1, top5), _ = train_one(
-        train_eeg, train_tgt, test_eeg, test_tgt, WINDOWS[window_name], seed)
-    print(f"[sanity] {target} @ {window_name} (seed {seed}): "
-          f"val_loss={vl:.4f}  test_loss={tl:.4f}  "
-          f"top1={top1*100:.2f}%  top5={top5*100:.2f}%", flush=True)
-    return {"target": target, "window": window_name,
-            "val_loss": vl, "test_loss": tl, "top1": top1, "top5": top5}
+# ---------------------------------------------------------------------------
+# Full temporal-resolution sanity check
+# ---------------------------------------------------------------------------
+
+# CHANGED:
+# This now trains one decoder using all 250 samples rather than one 100 ms
+# window.
+def sanity_check(
+    train_eeg,
+    test_eeg,
+    target,
+    seed=0,
+):
+    """
+    Train one decoder using the complete one-second EEG signal.
+    """
+
+    train_tgt = np.load(
+        os.path.join(
+            FEAT_DIR,
+            f"{target}__train.npy",
+        )
+    )
+
+    test_tgt = np.load(
+        os.path.join(
+            FEAT_DIR,
+            f"{target}__test.npy",
+        )
+    )
+
+    start_time = time.time()
+
+    (
+        validation_loss,
+        test_loss,
+        best_epoch,
+        top1,
+        top5,
+    ), _ = train_one(
+        train_eeg,
+        train_tgt,
+        test_eeg,
+        test_tgt,
+        FULL_WINDOW,
+        seed,
+    )
+
+    elapsed = time.time() - start_time
+
+    print(
+        f"[sanity] {target} @ full_1s "
+        f"(seed {seed}): "
+        f"val_loss={validation_loss:.4f} "
+        f"test_loss={test_loss:.4f} "
+        f"top1={top1 * 100:.2f}% "
+        f"top5={top5 * 100:.2f}% "
+        f"[{elapsed:.1f}s]",
+        flush=True,
+    )
+
+    sanity_result = pd.DataFrame(
+        [
+            {
+                "target": target,
+                "window": "full_1s",
+                "seed": seed,
+                "best_epoch": best_epoch,
+                "val_loss": validation_loss,
+                "test_loss": test_loss,
+                "top1": top1,
+                "top5": top5,
+                "elapsed_s": elapsed,
+            }
+        ]
+    )
+
+    sanity_result.to_csv(
+        SANITY_CSV,
+        index=False,
+    )
+
+    print(
+        "SAVED",
+        SANITY_CSV,
+        flush=True,
+    )
 
 
 def main():
-    print("device:", DEVICE, "| seeds:", SEEDS, flush=True)
 
-    # Load the prepared EEG once (shared across all targets/windows/seeds).
-    train_eeg = np.load(os.path.join(EEG_DIR, "sub-01_train_avg.npy"))
-    test_eeg  = np.load(os.path.join(EEG_DIR, "sub-01_test_avg.npy"))
+    print(
+        "device:",
+        DEVICE,
+        "| seeds:",
+        SEEDS,
+        "| decoder: EEGProjectLayer",
+        flush=True,
+    )
 
-    # ---- Point #2: verify the decoder input shape for a 100 ms window ----
-    n_ch = train_eeg.shape[1]
-    s, e = WINDOWS["100_200"]
-    realised = train_eeg[:1, :, s:e].shape          # (1, 63, 10)
-    in_dim_100ms = n_ch * (e - s)
-    print(f"decoder input per 100 ms window: {n_ch} ch x {e - s} samples = "
-          f"{in_dim_100ms}  (realised slice {realised})", flush=True)
-    assert n_ch == EXPECTED_NCHAN, f"expected {EXPECTED_NCHAN} channels, got {n_ch}"
-    assert (e - s) == WINDOW_SAMPLES, f"expected {WINDOW_SAMPLES} samples per window"
-    assert in_dim_100ms == EXPECTED_NCHAN * WINDOW_SAMPLES == 630, "decoder input is not 630"
+    # Load prepared EEG.
+    train_eeg = np.load(
+        os.path.join(
+            EEG_DIR,
+            "sub-01_train_avg.npy",
+        )
+    )
 
-    # Discover every feature set produced by step 02 (sharp AND foveated, #6).
-    targets = sorted(os.path.basename(f)[:-len("__train.npy")]
-                     for f in glob.glob(os.path.join(FEAT_DIR, "*__train.npy")))
-    n_dec = len(targets) * len(WINDOWS) * len(SEEDS)
-    print(f"{len(targets)} targets x {len(WINDOWS)} windows x {len(SEEDS)} seeds "
-          f"= {n_dec} decoders", flush=True)
+    test_eeg = np.load(
+        os.path.join(
+            EEG_DIR,
+            "sub-01_test_avg.npy",
+        )
+    )
 
-    # raw[(target, window, seed)] = (best_epoch, val_loss, test_loss, top1, top5)
-    raw, t0 = {}, time.time()
-    efile = open(EPOCH_CSV, "w", newline="")           # stream per-epoch traces (#3)
-    ew = csv.writer(efile)
-    ew.writerow(["target", "window", "seed", "epoch", "train_loss", "val_loss"])
+    print(
+        "train EEG:",
+        train_eeg.shape,
+        "| test EEG:",
+        test_eeg.shape,
+        flush=True,
+    )
 
-    for tgt_name in targets:
-        train_tgt = np.load(os.path.join(FEAT_DIR, f"{tgt_name}__train.npy"))
-        test_tgt  = np.load(os.path.join(FEAT_DIR, f"{tgt_name}__test.npy"))
-        for wname, window in WINDOWS.items():
+    # CHANGED: verify the new 250-point EEG shape.
+    assert train_eeg.shape == (
+        16540,
+        EXPECTED_NCHAN,
+        EXPECTED_NTIMES,
+    )
+
+    assert test_eeg.shape == (
+        200,
+        EXPECTED_NCHAN,
+        EXPECTED_NTIMES,
+    )
+
+    # -----------------------------------------------------------------------
+    # Verify the decoder input for one 100 ms window
+    # -----------------------------------------------------------------------
+
+    n_channels = train_eeg.shape[1]
+
+    start, end = WINDOWS["100_200"]
+
+    realised = train_eeg[
+        :1,
+        :,
+        start:end,
+    ].shape
+
+    input_dimension_100ms = (
+        n_channels
+        * (end - start)
+    )
+
+    print(
+        f"decoder input per 100 ms window: "
+        f"{n_channels} channels x "
+        f"{end - start} samples = "
+        f"{input_dimension_100ms} "
+        f"(realised slice {realised})",
+        flush=True,
+    )
+
+    assert n_channels == EXPECTED_NCHAN
+
+    assert (
+        end - start
+    ) == WINDOW_SAMPLES
+
+    # CHANGED: 63 × 25 = 1575.
+    assert input_dimension_100ms == (
+        EXPECTED_NCHAN
+        * WINDOW_SAMPLES
+    ) == 1575
+
+    print(
+        f"full 1-second decoder input: "
+        f"{EXPECTED_NCHAN} channels x "
+        f"{EXPECTED_NTIMES} samples = "
+        f"{EXPECTED_NCHAN * EXPECTED_NTIMES}",
+        flush=True,
+    )
+
+    # Discover sharp and foveated feature sets.
+    targets = sorted(
+        os.path.basename(feature_file)[
+            :-len("__train.npy")
+        ]
+        for feature_file in glob.glob(
+            os.path.join(
+                FEAT_DIR,
+                "*__train.npy",
+            )
+        )
+    )
+
+    n_decoders = (
+        len(targets)
+        * len(WINDOWS)
+        * len(SEEDS)
+    )
+
+    print(
+        f"{len(targets)} targets x "
+        f"{len(WINDOWS)} windows x "
+        f"{len(SEEDS)} seeds = "
+        f"{n_decoders} decoders",
+        flush=True,
+    )
+
+    raw = {}
+
+    # CHANGED:
+    # Store epoch information and save it with pandas at the end.
+    epoch_rows = []
+
+    experiment_start = time.time()
+
+    for target_name in targets:
+
+        train_target = np.load(
+            os.path.join(
+                FEAT_DIR,
+                f"{target_name}__train.npy",
+            )
+        )
+
+        test_target = np.load(
+            os.path.join(
+                FEAT_DIR,
+                f"{target_name}__test.npy",
+            )
+        )
+
+        assert train_target.shape[0] == train_eeg.shape[0]
+        assert test_target.shape[0] == test_eeg.shape[0]
+
+        for window_name, window in WINDOWS.items():
+
             for seed in SEEDS:
-                (vl, tl, ep, top1, top5), trace = train_one(
-                    train_eeg, train_tgt, test_eeg, test_tgt, window, seed)
-                raw[(tgt_name, wname, seed)] = (ep, vl, tl, top1, top5)
-                for (e_, trl, vl_) in trace:
-                    ew.writerow([tgt_name, wname, seed, e_, round(trl, 4), round(vl_, 4)])
-                print(f"{tgt_name:28s} {wname:9s} seed{seed} | ep{ep:2d} "
-                      f"val{vl:.3f} test{tl:.3f} top1{top1*100:4.1f}% top5{top5*100:4.1f}% "
-                      f"[{time.time()-t0:.0f}s]", flush=True)
-    efile.close()
-    print("\nSAVED", EPOCH_CSV, flush=True)
 
-    # ---- per-seed raw results ----
-    with open(OUT_CSV_SEEDS, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["target", "window", "seed", "best_epoch", "val_loss", "test_loss", "top1", "top5"])
-        for (tgt, wname, seed), (ep, vl, tl, top1, top5) in raw.items():
-            w.writerow([tgt, wname, seed, ep, round(vl, 4), round(tl, 4),
-                        round(top1, 4), round(top5, 4)])
-    print("SAVED", OUT_CSV_SEEDS, flush=True)
+                (
+                    validation_loss,
+                    test_loss,
+                    best_epoch,
+                    top1,
+                    top5,
+                ), trace = train_one(
+                    train_eeg,
+                    train_target,
+                    test_eeg,
+                    test_target,
+                    window,
+                    seed,
+                )
 
-    # ---- averaged over seeds (step 04 reads this) ----
-    with open(OUT_CSV, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["target", "window", "test_loss", "test_loss_std", "top1", "top5", "n_seeds"])
-        for tgt_name in targets:
-            for wname in WINDOWS:
-                tls  = [raw[(tgt_name, wname, s)][2] for s in SEEDS]
-                t1s  = [raw[(tgt_name, wname, s)][3] for s in SEEDS]
-                t5s  = [raw[(tgt_name, wname, s)][4] for s in SEEDS]
-                w.writerow([tgt_name, wname,
-                            round(float(np.mean(tls)), 4), round(float(np.std(tls)), 4),
-                            round(float(np.mean(t1s)), 4), round(float(np.mean(t5s)), 4),
-                            len(SEEDS)])
-    print("SAVED", OUT_CSV, flush=True)
+                raw[
+                    (
+                        target_name,
+                        window_name,
+                        seed,
+                    )
+                ] = (
+                    best_epoch,
+                    validation_loss,
+                    test_loss,
+                    top1,
+                    top5,
+                )
 
-    # ---- best-window stability across seeds ----
-    post = [w for w in WINDOWS if w != "baseline"]
-    print("\n=== Best-window stability across seeds ===", flush=True)
-    for tgt_name in targets:
-        bps = [post[int(np.argmin([raw[(tgt_name, w, s)][2] for w in post]))] for s in SEEDS]
-        vals, counts = np.unique(bps, return_counts=True)
-        mode = vals[int(np.argmax(counts))]; agree = counts.max() / len(SEEDS)
-        print(f"{tgt_name:28s} {str(bps):45s} {mode} ({agree*100:.0f}%)", flush=True)
+                # CHANGED: trace now contains dictionaries.
+                for epoch_result in trace:
 
-    # ---- Point #4: single-condition sanity check (loss vs accuracy move together) ----
-    if os.path.exists(os.path.join(FEAT_DIR, f"{DEEP_LAYER}__train.npy")):
-        print("\n=== Sanity check (#4) ===", flush=True)
-        sanity_check(train_eeg, test_eeg, DEEP_LAYER, "200_300", seed=0)
+                    epoch_rows.append(
+                        {
+                            "target": target_name,
+                            "window": window_name,
+                            "seed": seed,
+                            **epoch_result,
+                        }
+                    )
 
-    # ---- Point #5: top-1/top-5 of the deepest, most semantic layer, per window ----
-    if any(k[0] == DEEP_LAYER for k in raw):
-        with open(OBJ_CSV, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["target", "window", "top1", "top5"])
-            best = (None, -1.0, -1.0)
-            for wname in WINDOWS:
-                t1 = float(np.mean([raw[(DEEP_LAYER, wname, s)][3] for s in SEEDS]))
-                t5 = float(np.mean([raw[(DEEP_LAYER, wname, s)][4] for s in SEEDS]))
-                w.writerow([DEEP_LAYER, wname, round(t1, 4), round(t5, 4)])
-                if t1 > best[1]:
-                    best = (wname, t1, t5)
-        print(f"\n=== Object-perception accuracy (#5): {DEEP_LAYER} ===", flush=True)
-        print(f"best window {best[0]}: top1={best[1]*100:.2f}%  top5={best[2]*100:.2f}%", flush=True)
-        print("SAVED", OBJ_CSV, flush=True)
+                print(
+                    f"{target_name:28s} "
+                    f"{window_name:9s} "
+                    f"seed{seed} | "
+                    f"ep{best_epoch:2d} "
+                    f"val{validation_loss:.3f} "
+                    f"test{test_loss:.3f} "
+                    f"top1{top1 * 100:4.1f}% "
+                    f"top5{top5 * 100:4.1f}% "
+                    f"[{time.time() - experiment_start:.0f}s]",
+                    flush=True,
+                )
+
+    # CHANGED: Save complete epoch log using pandas.
+    epoch_dataframe = pd.DataFrame(
+        epoch_rows
+    )
+
+    epoch_dataframe.to_csv(
+        EPOCH_CSV,
+        index=False,
+    )
+
+    print(
+        "\nSAVED",
+        EPOCH_CSV,
+        flush=True,
+    )
+
+    # -----------------------------------------------------------------------
+    # Per-seed raw results
+    # -----------------------------------------------------------------------
+
+    with open(
+        OUT_CSV_SEEDS,
+        "w",
+        newline="",
+    ) as file:
+
+        writer = csv.writer(file)
+
+        writer.writerow(
+            [
+                "target",
+                "window",
+                "seed",
+                "best_epoch",
+                "val_loss",
+                "test_loss",
+                "top1",
+                "top5",
+            ]
+        )
+
+        for (
+            target_name,
+            window_name,
+            seed,
+        ), (
+            best_epoch,
+            validation_loss,
+            test_loss,
+            top1,
+            top5,
+        ) in raw.items():
+
+            writer.writerow(
+                [
+                    target_name,
+                    window_name,
+                    seed,
+                    best_epoch,
+                    round(validation_loss, 4),
+                    round(test_loss, 4),
+                    round(top1, 4),
+                    round(top5, 4),
+                ]
+            )
+
+    print(
+        "SAVED",
+        OUT_CSV_SEEDS,
+        flush=True,
+    )
+
+    # -----------------------------------------------------------------------
+    # Averaged over seeds
+    # -----------------------------------------------------------------------
+
+    with open(
+        OUT_CSV,
+        "w",
+        newline="",
+    ) as file:
+
+        writer = csv.writer(file)
+
+        writer.writerow(
+            [
+                "target",
+                "window",
+                "test_loss",
+                "test_loss_std",
+                "top1",
+                "top5",
+                "n_seeds",
+            ]
+        )
+
+        for target_name in targets:
+
+            for window_name in WINDOWS:
+
+                test_losses = [
+                    raw[
+                        (
+                            target_name,
+                            window_name,
+                            seed,
+                        )
+                    ][2]
+                    for seed in SEEDS
+                ]
+
+                top1_values = [
+                    raw[
+                        (
+                            target_name,
+                            window_name,
+                            seed,
+                        )
+                    ][3]
+                    for seed in SEEDS
+                ]
+
+                top5_values = [
+                    raw[
+                        (
+                            target_name,
+                            window_name,
+                            seed,
+                        )
+                    ][4]
+                    for seed in SEEDS
+                ]
+
+                writer.writerow(
+                    [
+                        target_name,
+                        window_name,
+                        round(float(np.mean(test_losses)), 4),
+                        round(float(np.std(test_losses)), 4),
+                        round(float(np.mean(top1_values)), 4),
+                        round(float(np.mean(top5_values)), 4),
+                        len(SEEDS),
+                    ]
+                )
+
+    print(
+        "SAVED",
+        OUT_CSV,
+        flush=True,
+    )
+
+    # -----------------------------------------------------------------------
+    # Best-window stability across seeds
+    # -----------------------------------------------------------------------
+
+    print(
+        "\n=== Best-window stability across seeds ===",
+        flush=True,
+    )
+
+    for target_name in targets:
+
+        best_windows = [
+            list(WINDOWS.keys())[
+                int(
+                    np.argmin(
+                        [
+                            raw[
+                                (
+                                    target_name,
+                                    window_name,
+                                    seed,
+                                )
+                            ][2]
+                            for window_name in WINDOWS
+                        ]
+                    )
+                )
+            ]
+            for seed in SEEDS
+        ]
+
+        values, counts = np.unique(
+            best_windows,
+            return_counts=True,
+        )
+
+        mode = values[
+            int(np.argmax(counts))
+        ]
+
+        agreement = counts.max() / len(SEEDS)
+
+        print(
+            f"{target_name:28s} "
+            f"{str(best_windows):55s} "
+            f"{mode} "
+            f"({agreement * 100:.0f}%)",
+            flush=True,
+        )
+
+    # -----------------------------------------------------------------------
+    # Full one-second sanity check
+    # -----------------------------------------------------------------------
+
+    if os.path.exists(
+        os.path.join(
+            FEAT_DIR,
+            f"{DEEP_LAYER}__train.npy",
+        )
+    ):
+
+        print(
+            "\n=== Full 1-second sanity check ===",
+            flush=True,
+        )
+
+        sanity_check(
+            train_eeg,
+            test_eeg,
+            DEEP_LAYER,
+            seed=0,
+        )
+
+    # -----------------------------------------------------------------------
+    # Deepest-layer top-1/top-5
+    # -----------------------------------------------------------------------
+
+    if any(
+        key[0] == DEEP_LAYER
+        for key in raw
+    ):
+
+        with open(
+            OBJ_CSV,
+            "w",
+            newline="",
+        ) as file:
+
+            writer = csv.writer(file)
+
+            writer.writerow(
+                [
+                    "target",
+                    "window",
+                    "top1",
+                    "top5",
+                ]
+            )
+
+            best = (
+                None,
+                -1.0,
+                -1.0,
+            )
+
+            for window_name in WINDOWS:
+
+                top1 = float(
+                    np.mean(
+                        [
+                            raw[
+                                (
+                                    DEEP_LAYER,
+                                    window_name,
+                                    seed,
+                                )
+                            ][3]
+                            for seed in SEEDS
+                        ]
+                    )
+                )
+
+                top5 = float(
+                    np.mean(
+                        [
+                            raw[
+                                (
+                                    DEEP_LAYER,
+                                    window_name,
+                                    seed,
+                                )
+                            ][4]
+                            for seed in SEEDS
+                        ]
+                    )
+                )
+
+                writer.writerow(
+                    [
+                        DEEP_LAYER,
+                        window_name,
+                        round(top1, 4),
+                        round(top5, 4),
+                    ]
+                )
+
+                if top1 > best[1]:
+
+                    best = (
+                        window_name,
+                        top1,
+                        top5,
+                    )
+
+        print(
+            f"\n=== Object-perception accuracy: "
+            f"{DEEP_LAYER} ===",
+            flush=True,
+        )
+
+        print(
+            f"best window {best[0]}: "
+            f"top1={best[1] * 100:.2f}% "
+            f"top5={best[2] * 100:.2f}%",
+            flush=True,
+        )
+
+        print(
+            "SAVED",
+            OBJ_CSV,
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

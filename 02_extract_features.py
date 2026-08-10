@@ -61,8 +61,11 @@ BATCH   = 64      # number of images processed at once
 LIMIT   = None    # set to a small number (e.g. 200) for a quick test; None = all images
 
 # PCA target dimension -- the single place to change the post-PCA feature length.
-# PENDING supervisor confirmation: shallow layers (e.g. RN50 stem) have a native
-# dimension below this, which the dimensionality check below will flag (see #1).
+# DECIDED: proceed with uneven feature dimensions. Layers whose native dimension
+# is below this cap keep their native size (RN50 stem -> 64, layer1 -> 256); all
+# other layers are reduced to 512. The dimensionality table is still printed for
+# reference. NB: top-1 scores in step 03 are not strictly comparable across layers
+# of differing dimension, since a smaller target is easier/harder to decode.
 PCA_DIM = 512
 
 # --- Foveation parameters (point #6) --- PENDING supervisor confirmation -------
@@ -76,6 +79,15 @@ FOV_FALLOFF    = 2.0           # how fast blur grows with eccentricity (higher =
 
 # The 6 layers ("taps") to record from each network, ordered shallow -> deep.
 # RN50 taps are named stages; ViT taps are transformer block numbers (1-indexed).
+#
+# Native (pre-PCA) dimension of every tapped layer, per network. For RN50 conv
+# stages this is the channel count after Global Average Pooling; for attnpool the
+# projection output; for ViT taps the transformer width (CLS-token dimension).
+# All ViT blocks share one width, so every ViT tap has the same native dimension.
+#   RN50-quickgelu:      stem 64 | layer1 256 | layer2 512 | layer3 1024 | layer4 2048 | attnpool 1024
+#   ViT-B-16-quickgelu:  blocks 2,4,6,8,10,12  -> 768 each
+#   ViT-L-14-quickgelu:  blocks 4,8,12,16,20,24 -> 1024 each
+# (PCA_DIM=512 therefore caps every layer at 512; stem/layer1 stay 64/256.)
 NETWORKS = {
     "RN50-quickgelu":     ["stem", "layer1", "layer2", "layer3", "layer4", "attnpool"],
     "ViT-B-16-quickgelu": [2, 4, 6, 8, 10, 12],     # ViT-B-16 has 12 blocks
@@ -90,6 +102,65 @@ def load_metadata():
     test  = list(zip(m["test_img_concepts"],  m["test_img_files"]))
     return train, test
 
+def verify_image_order(train_items, test_items):
+
+    train = torch.load(
+        os.path.join(
+            ROOT,
+            "preprocessed_data",
+            "Preprocessed_data_250Hz_whiten",
+            "sub-01",
+            "train.pt",
+        ),
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    test = torch.load(
+        os.path.join(
+            ROOT,
+            "preprocessed_data",
+            "Preprocessed_data_250Hz_whiten",
+            "sub-01",
+            "test.pt",
+        ),
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    train_eeg = [
+        (
+            os.path.basename(os.path.dirname(p)),
+            os.path.basename(p),
+        )
+        for p in train["img"]
+    ]
+
+    train_meta = [
+        (str(c), str(f))
+        for c, f in train_items
+    ]
+
+    assert train_eeg == train_meta, \
+        "Training image order does not match EEG order."
+
+    test_eeg = [
+        (
+            os.path.basename(os.path.dirname(p)),
+            os.path.basename(p),
+        )
+        for p in test["img"]
+    ]
+
+    test_meta = [
+        (str(c), str(f))
+        for c, f in test_items
+    ]
+
+    assert test_eeg == test_meta, \
+        "Test image order does not match EEG order."
+
+    print("✓ Image order matches EEG order.")
 
 def image_path(split, concept, fname):
     """Build the full path to one image file."""
@@ -257,6 +328,7 @@ def extract_split(model, preprocess, arch, items, split, names, feats, transform
 def main():
     print("device:", DEVICE, "| LIMIT:", LIMIT, "| variants:", list(VARIANTS), flush=True)
     train_items, test_items = load_metadata()
+    verify_image_order(train_items, test_items)
     print(f"train {len(train_items)} | test {len(test_items)}", flush=True)
 
     # ---- Point #1: dimensionality table + PCA sanity check (before any heavy work) ----
@@ -272,18 +344,6 @@ def main():
     for net, layer, native, post in dim_rows:
         print(f"{net:14s} {layer:10s} {native:7d} {post:9d}", flush=True)
     print("saved ->", dim_csv, flush=True)
-
-    # Stop (do not silently proceed) if any layer is narrower than the PCA target,
-    # because PCA cannot expand dimensions and the PCA target then needs revising.
-    smallest = min(native for _, _, native, _ in dim_rows)
-    offenders = [(n, l, d) for n, l, d, _ in dim_rows if d < PCA_DIM]
-    if offenders:
-        msg = ", ".join(f"{n}/{l}={d}" for n, l, d in offenders)
-        raise SystemExit(
-            f"\n[STOP] PCA_DIM={PCA_DIM} exceeds the native dimension of: {msg}.\n"
-            f"        Smallest native dimension is {smallest}. PCA cannot expand "
-            f"dimensions, so either lower PCA_DIM to <= {smallest}, or drop these "
-            f"shallow layers. Set the PCA target with the supervisor, then re-run.")
 
     # ---- Feature extraction (sharp + foveated variants) ----
     for arch, layers in NETWORKS.items():
