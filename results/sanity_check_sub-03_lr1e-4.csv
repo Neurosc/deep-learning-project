@@ -1,0 +1,2 @@
+target,window,seed,best_epoch,val_loss,test_loss,top1,top5,elapsed_s
+ViT-L-14__block24,full_1s,0,5,6.617745399475098,3.545076370239258,0.2199999988079071,0.550000011920929,35.49033570289612
